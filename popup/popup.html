@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RcdRmd - Bilibili Deleted Video Tracker</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Header -->
+    <header class="header">
+      <div class="brand">
+        <img src="../icons/icon-32.png" alt="RcdRmd Logo" class="brand-icon" id="brandIcon">
+        <div class="brand-text">
+          <div class="brand-title-row">
+            <h1 class="brand-title">RcdRmd</h1>
+            <span class="browser-badge" id="currentBrowserBadge" title="当前浏览器">Microsoft Edge</span>
+          </div>
+          <div class="workspace-indicator-row">
+            <span class="workspace-pill" id="currentWorkspacePill" title="点击可重命名当前工作区/窗口">
+              <span class="ws-dot"></span>
+              <span id="currentWorkspaceName">检测工作区...</span>
+              <span class="ws-tab-count" id="currentWorkspaceCount">(0)</span>
+              <span class="ws-edit-btn" id="renameWorkspaceBtn" title="修改工作区名称">✏️</span>
+            </span>
+          </div>
+        </div>
+      </div>
+      <div class="header-right">
+        <button class="icon-button" id="quickSyncBtn" title="立即检查并同步">
+          <svg class="sync-icon" viewBox="0 0 24 24" width="16" height="16">
+            <path fill="currentColor" d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6 0 1.01-.25 1.97-.7 2.8l1.46 1.46C19.54 15.03 20 13.57 20 12c0-4.42-3.58-8-8-8zm0 14c-3.31 0-6-2.69-6-6 0-1.01.25-1.97.7-2.8L5.24 7.74C4.46 8.97 4 10.43 4 12c0 4.42 3.58 8 8 8v3l4-4-4-4v3z"/>
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- Navigation Tabs -->
+    <nav class="nav-tabs">
+      <button class="tab-btn active" data-tab="deleted">
+        <span>已失效视频</span>
+        <span class="badge badge-alert" id="deletedBadge">0</span>
+      </button>
+      <button class="tab-btn" data-tab="tabs">
+        <span>当前打开标签</span>
+        <span class="badge" id="tabsBadge" title="当前工作区标签数">0</span>
+      </button>
+      <button class="tab-btn" data-tab="sync">
+        <span>跨浏览器同步</span>
+        <span class="status-dot" id="syncStatusDot" title="同步状态"></span>
+      </button>
+    </nav>
+
+    <!-- Main Content Area -->
+    <main class="content-area">
+      <!-- VIEW 1: Deleted Videos List -->
+      <section class="tab-view active" id="view-deleted">
+        <div class="alert-banner hidden" id="yellowAlertBanner">
+          <div class="alert-icon">⚠️</div>
+          <div class="alert-content">
+            <div class="alert-title">发现已被删除/失效的B站视频！</div>
+            <div class="alert-desc">原标题和UP主已记录。点击消除黄点标记。</div>
+          </div>
+          <button class="btn btn-sm btn-yellow" id="ackAlertBtn">知道了 (消除黄点)</button>
+        </div>
+
+        <div class="toolbar">
+          <div class="search-box">
+            <input type="text" id="deletedSearchInput" placeholder="搜索已删视频标题或UP主..." />
+          </div>
+          <div class="tool-actions">
+            <button class="btn btn-outline btn-xs" id="exportBtn" title="导出记录为 JSON/CSV">导出</button>
+            <button class="btn btn-outline btn-xs text-danger" id="clearAllDeletedBtn" title="清空失效记录">清空</button>
+          </div>
+        </div>
+
+        <div class="list-container" id="deletedListContainer">
+          <!-- Populated by popup.js -->
+        </div>
+
+        <div class="empty-state hidden" id="deletedEmptyState">
+          <div class="empty-icon">🎉</div>
+          <div class="empty-title">暂无已删除或失效的视频</div>
+          <div class="empty-subtitle">所有工作区中的B站标签均安全正常。当有视频被UP主删除并重定向到首页时，RcdRmd会立即捕捉并点亮黄色通知！</div>
+        </div>
+      </section>
+
+      <!-- VIEW 2: Active Opening Tabs -->
+      <section class="tab-view" id="view-tabs">
+        <!-- Workspace Filter Bar -->
+        <div class="workspace-chips-bar" id="workspaceChipsContainer">
+          <!-- Chips populated by popup.js: [当前工作区 (68)] [全部工作区 (220)] [Mixed (152)] [Dev (68)] -->
+        </div>
+
+        <div class="tabs-search-bar">
+          <input type="text" id="activeTabsSearchInput" placeholder="搜索打开的标签标题或UP主..." />
+          <span class="tabs-summary-chip" id="tabsSummaryChip">共 0 标签</span>
+        </div>
+
+        <div class="list-container" id="activeTabsListContainer">
+          <!-- Populated by popup.js with workspace grouping -->
+        </div>
+
+        <div class="empty-state hidden" id="tabsEmptyState">
+          <div class="empty-icon">📺</div>
+          <div class="empty-title">选定范围内没有打开的B站标签</div>
+          <div class="empty-subtitle">请切换上方工作区或浏览器筛选，或在当前窗口中打开B站视频。</div>
+        </div>
+      </section>
+
+      <!-- VIEW 3: Sync & Settings -->
+      <section class="tab-view" id="view-sync">
+        <div class="settings-card">
+          <div class="card-title">多窗口与工作区概览</div>
+          <div class="workspace-summary-list" id="workspaceSummaryList">
+            <!-- Window counts populated by popup.js -->
+          </div>
+        </div>
+
+        <div class="settings-card">
+          <div class="card-title">跨浏览器同步中心 (Edge / Chrome / Canary)</div>
+          <div class="sync-info-row">
+            <span class="info-label">同步服务状态:</span>
+            <span class="status-pill" id="syncServiceStatusPill">检测中...</span>
+          </div>
+          <div class="sync-info-row">
+            <span class="info-label">本地服务地址:</span>
+            <code class="info-code" id="syncServerUrlText">http://127.0.0.1:32188</code>
+          </div>
+          <div class="sync-info-row">
+            <span class="info-label">上次同步时间:</span>
+            <span id="lastSyncTimeText">尚未同步</span>
+          </div>
+          <div class="sync-info-row">
+            <span class="info-label">同步周期:</span>
+            <span>每 30 分钟自动检查并同步</span>
+          </div>
+          <div class="card-actions">
+            <button class="btn btn-primary" id="manualSyncBtn">立即执行跨浏览器同步</button>
+          </div>
+        </div>
+
+        <div class="settings-card">
+          <div class="card-title">当前浏览器身份设置</div>
+          <p class="card-desc">在跨浏览器数据集中区分来源浏览器：</p>
+          <div class="input-group">
+            <select id="browserIdentitySelect">
+              <option value="auto">自动检测</option>
+              <option value="Microsoft Edge">Microsoft Edge</option>
+              <option value="Google Chrome">Google Chrome</option>
+              <option value="Google Chrome Canary">Google Chrome Canary</option>
+            </select>
+            <button class="btn btn-outline" id="saveBrowserNameBtn">保存</button>
+          </div>
+        </div>
+
+        <div class="settings-card">
+          <div class="card-title">本地数据存储文件</div>
+          <div class="file-path-box">
+            <code>sync-server/rcdrmd-dataset.json</code> (位于插件目录下)
+          </div>
+          <div class="helper-text">
+            * 提示：运行 <code>sync-server\start-server.bat</code> 即可在后台开启极轻量同步服务。即使未开启，扩展也会在当前浏览器中完整独立工作。
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- Footer -->
+    <footer class="footer">
+      <div class="footer-left">
+        <span class="status-indicator"></span>
+        <span id="footerStatusText">运行中 · 每30分钟自动检测</span>
+      </div>
+      <div class="footer-right">
+        <span>RcdRmd v1.0.0</span>
+      </div>
+    </footer>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
