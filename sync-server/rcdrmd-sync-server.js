@@ -11,15 +11,6 @@ const path = require('path');
 const PORT = 32188;
 const DATASET_FILE = path.join(__dirname, 'rcdrmd-dataset.json');
 
-// Shared token that must accompany every data request.
-// The real hardening is localhost-only binding; this token blocks casual
-// drive-by requests from arbitrary web pages that don't know it.
-const SYNC_TOKEN = 'rcdrmd-local-sync-token';
-
-function isValidToken(req) {
-  return req.headers['x-rcdrmd-token'] === SYNC_TOKEN;
-}
-
 function loadDataset() {
   try {
     if (fs.existsSync(DATASET_FILE)) {
@@ -52,19 +43,14 @@ function saveDataset(data) {
 
 let dataset = loadDataset();
 
-function setCorsHeaders(req, res) {
-  // Only reflect the origin when the caller presents a valid token.
-  // The extension talks to this server via its `host_permissions`, so it
-  // bypasses CORS entirely and is unaffected by this tightening.
-  if (isValidToken(req)) {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-  }
+function setCorsHeaders(res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept, X-RcdRmd-Token');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept');
 }
 
 const server = http.createServer((req, res) => {
-  setCorsHeaders(req, res);
+  setCorsHeaders(res);
 
   if (req.method === 'OPTIONS') {
     res.writeHead(204);
@@ -73,15 +59,6 @@ const server = http.createServer((req, res) => {
   }
 
   const url = new URL(req.url, `http://localhost:${PORT}`);
-
-  // Authentication check: require the shared token on every data endpoint.
-  // Without it, an arbitrary web page cannot read the dataset or inject
-  // polluting records via a no-cors form/body POST.
-  if ((req.method === 'GET' || req.method === 'POST') && !isValidToken(req)) {
-    res.writeHead(401, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Unauthorized: missing or invalid X-RcdRmd-Token' }));
-    return;
-  }
 
   // Route: GET /api/status
   if (req.method === 'GET' && url.pathname === '/api/status') {
@@ -153,9 +130,13 @@ const server = http.createServer((req, res) => {
           }
         });
 
-        // 3. Merge deleted videos
+        // 3. Merge deleted videos (ignoring any legacy false HTTP 412 / network errors)
         if (!dataset.deletedVideos) dataset.deletedVideos = [];
         incomingDeleted.forEach(delItem => {
+          const r = (delItem.reason || '').toLowerCase();
+          if (r.includes('http 412') || r.includes('http 403') || r.includes('http 429') || r.includes('http 5')) {
+            return;
+          }
           const matchIdx = dataset.deletedVideos.findIndex(v =>
             (v.bvid && delItem.bvid && v.bvid === delItem.bvid) ||
             (v.id && delItem.id && v.id === delItem.id)
@@ -175,6 +156,11 @@ const server = http.createServer((req, res) => {
               dataset.deletedVideos[matchIdx].channel = delItem.channel;
             }
           }
+        });
+
+        dataset.deletedVideos = dataset.deletedVideos.filter(v => {
+          const r = (v.reason || '').toLowerCase();
+          return !r.includes('http 412') && !r.includes('http 403') && !r.includes('http 429') && !r.includes('http 5');
         });
 
         saveDataset(dataset);

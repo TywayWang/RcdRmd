@@ -81,52 +81,75 @@
       '.not-found',
       '.video-error',
       '.page-404',
-      '.error-body'
+      '.error-body',
+      '.error-panel'
     ];
 
     for (const sel of errorSelectors) {
       const el = document.querySelector(sel);
-      if (el && el.offsetParent !== null) { // visible
-        return { isDeleted: true, reason: 'Error container detected on page' };
-      }
-    }
-
-    // Check key phrases in body
-    const bodyText = document.body ? document.body.innerText : '';
-    if (bodyText) {
-      const deletedPhrases = [
-        '视频不见了哦',
-        '稿件已被删除',
-        '已被UP主删除',
-        '非常抱歉，视频不存在或已被删除',
-        '啊咧？视频不见了',
-        '你感兴趣的视频不见了',
-        '该视频已被删除',
-        '视频已失效'
-      ];
-      for (const phrase of deletedPhrases) {
-        if (bodyText.includes(phrase)) {
-          return { isDeleted: true, reason: phrase };
-        }
+      if (el && (el.offsetWidth > 0 || el.offsetHeight > 0 || el.offsetParent !== null)) {
+        const text = (el.innerText || '').trim();
+        return { isDeleted: true, reason: text ? text.slice(0, 60) : '页面显示视频失效或错误提示' };
       }
     }
 
     return { isDeleted: false };
   }
 
+  // Safe context validity check to prevent "Extension context invalidated" errors upon extension reload
+  let pollInterval = null;
+  let observer = null;
+
+  function isExtensionContextValid() {
+    return typeof chrome !== 'undefined' && Boolean(chrome.runtime && chrome.runtime.id);
+  }
+
+  function cleanup() {
+    if (pollInterval) {
+      clearInterval(pollInterval);
+      pollInterval = null;
+    }
+    if (observer) {
+      observer.disconnect();
+      observer = null;
+    }
+  }
+
+  function safeSendMessage(payload) {
+    if (!isExtensionContextValid()) {
+      cleanup();
+      return;
+    }
+    try {
+      chrome.runtime.sendMessage(payload).catch(() => {});
+    } catch (err) {
+      cleanup();
+    }
+  }
+
   // Main scanner
   function scanPage() {
+    if (!isExtensionContextValid()) {
+      cleanup();
+      return;
+    }
+
     const currentUrl = window.location.href;
     const bvid = extractBvid(currentUrl);
 
     // If on homepage or error page
     if (currentUrl === 'https://www.bilibili.com/' ||
         currentUrl.startsWith('https://www.bilibili.com/?') ||
+        currentUrl.startsWith('https://www.bilibili.com/#') ||
         currentUrl.includes('/404')) {
-      chrome.runtime.sendMessage({
+      const nav = (performance.getEntriesByType && performance.getEntriesByType('navigation')[0]) || null;
+      const isRedirect = Boolean((nav && nav.redirectCount > 0) || (document.referrer && document.referrer.includes('/video/')));
+      safeSendMessage({
         type: 'LANDING_PAGE_ACTIVE',
-        url: currentUrl
-      }).catch(() => {});
+        url: currentUrl,
+        isRedirect: isRedirect,
+        referrer: document.referrer || ''
+      });
       return;
     }
 
@@ -134,14 +157,14 @@
     if (bvid || currentUrl.includes('/video/') || currentUrl.includes('/bangumi/play/')) {
       const deletedCheck = checkIsDeletedOrRemoved();
       if (deletedCheck.isDeleted) {
-        chrome.runtime.sendMessage({
+        safeSendMessage({
           type: 'VIDEO_DELETED_DETECTED',
           data: {
             bvid: bvid,
             url: currentUrl,
             reason: deletedCheck.reason
           }
-        }).catch(() => {});
+        });
         return;
       }
 
@@ -149,7 +172,7 @@
       const channel = extractChannel();
 
       if (title || channel || bvid) {
-        chrome.runtime.sendMessage({
+        safeSendMessage({
           type: 'RECORD_TAB_METADATA',
           data: {
             bvid: bvid,
@@ -157,56 +180,58 @@
             title: title,
             channel: channel
           }
-        }).catch(() => {});
+        });
       }
     }
   }
 
-  // Scan immediately
-  scanPage();
-
-  // Polling / retry scanning as SPA elements render
-  let attempts = 0;
-  const pollInterval = setInterval(() => {
-    attempts++;
+  // Scan immediately if extension context is valid
+  if (isExtensionContextValid()) {
     scanPage();
-    if (attempts >= 8) {
-      clearInterval(pollInterval);
-    }
-  }, 1000);
 
-  // Observe DOM changes for SPA navigation
-  const observer = new MutationObserver(() => {
-    scanPage();
-  });
-
-  if (document.body) {
-    observer.observe(document.body, { childList: true, subtree: true });
-  } else {
-    document.addEventListener('DOMContentLoaded', () => {
-      if (document.body) {
-        observer.observe(document.body, { childList: true, subtree: true });
+    // Polling / retry scanning as SPA elements render
+    let attempts = 0;
+    pollInterval = setInterval(() => {
+      attempts++;
+      scanPage();
+      if (attempts >= 8 || !isExtensionContextValid()) {
+        cleanup();
       }
+    }, 1000);
+
+    // Observe DOM changes for SPA navigation
+    observer = new MutationObserver(() => {
+      scanPage();
     });
-  }
 
-  // Listen for messages from background
-  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    if (message.type === 'GET_PAGE_METADATA') {
-      const bvid = extractBvid(window.location.href);
-      const title = extractTitle();
-      const channel = extractChannel();
-      const deletedCheck = checkIsDeletedOrRemoved();
-      sendResponse({
-        bvid,
-        title,
-        channel,
-        url: window.location.href,
-        isDeleted: deletedCheck.isDeleted,
-        reason: deletedCheck.reason
+    if (document.body) {
+      observer.observe(document.body, { childList: true, subtree: true });
+    } else {
+      document.addEventListener('DOMContentLoaded', () => {
+        if (document.body && isExtensionContextValid() && observer) {
+          observer.observe(document.body, { childList: true, subtree: true });
+        }
       });
     }
-    return true;
-  });
+
+    // Listen for messages from background
+    chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+      if (message.type === 'GET_PAGE_METADATA') {
+        const bvid = extractBvid(window.location.href);
+        const title = extractTitle();
+        const channel = extractChannel();
+        const deletedCheck = checkIsDeletedOrRemoved();
+        sendResponse({
+          bvid,
+          title,
+          channel,
+          url: window.location.href,
+          isDeleted: deletedCheck.isDeleted,
+          reason: deletedCheck.reason
+        });
+      }
+      return true;
+    });
+  }
 
 })();

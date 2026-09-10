@@ -14,14 +14,6 @@ from urllib.parse import urlparse
 PORT = 32188
 DATASET_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rcdrmd-dataset.json')
 
-# Shared token that must accompany every data request.
-# The real hardening is localhost-only binding; this token blocks casual
-# drive-by requests from arbitrary web pages that don't know it.
-SYNC_TOKEN = 'rcdrmd-local-sync-token'
-
-def _is_valid_token(self):
-    return self.headers.get('X-RcdRmd-Token') == SYNC_TOKEN
-
 def load_dataset():
     if os.path.exists(DATASET_FILE):
         try:
@@ -51,13 +43,9 @@ dataset = load_dataset()
 
 class SyncHandler(BaseHTTPRequestHandler):
     def _set_cors(self):
-        # Only reflect the origin when the caller presents a valid token.
-        # The extension talks to this server via its `host_permissions`, so it
-        # bypasses CORS entirely and is unaffected by this tightening.
-        if self._is_valid_token():
-            self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Accept, X-RcdRmd-Token')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Accept')
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -66,13 +54,6 @@ class SyncHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
-        if not self._is_valid_token():
-            self.send_response(401)
-            self._set_cors()
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(b'{"error":"Unauthorized: missing or invalid X-RcdRmd-Token"}')
-            return
         if parsed.path == '/api/status':
             self.send_response(200)
             self._set_cors()
@@ -110,13 +91,6 @@ class SyncHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urlparse(self.path)
         if parsed.path == '/api/sync':
-            if not self._is_valid_token():
-                self.send_response(401)
-                self._set_cors()
-                self.send_header('Content-Type', 'application/json')
-                self.end_headers()
-                self.wfile.write(b'{"error":"Unauthorized: missing or invalid X-RcdRmd-Token"}')
-                return
             length = int(self.headers.get('Content-Length', 0))
             body_bytes = self.rfile.read(length)
             try:
@@ -152,6 +126,9 @@ class SyncHandler(BaseHTTPRequestHandler):
                 if "deletedVideos" not in dataset:
                     dataset["deletedVideos"] = []
                 for del_item in incoming_deleted:
+                    r = (del_item.get("reason") or "").lower()
+                    if "http 412" in r or "http 403" in r or "http 429" in r or "http 5" in r:
+                        continue
                     bvid = del_item.get("bvid")
                     item_id = del_item.get("id")
                     match_idx = -1
@@ -170,6 +147,13 @@ class SyncHandler(BaseHTTPRequestHandler):
                             dataset["deletedVideos"][match_idx]["title"] = del_item["title"]
                         if del_item.get("channel"):
                             dataset["deletedVideos"][match_idx]["channel"] = del_item["channel"]
+
+                dataset["deletedVideos"] = [
+                    v for v in dataset["deletedVideos"]
+                    if "http 412" not in (v.get("reason") or "").lower()
+                    and "http 403" not in (v.get("reason") or "").lower()
+                    and "http 429" not in (v.get("reason") or "").lower()
+                ]
 
                 save_dataset(dataset)
 

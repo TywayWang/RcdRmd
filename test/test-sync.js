@@ -14,8 +14,6 @@ const fs = require('fs');
 
 const SERVER_PATH = path.join(__dirname, '..', 'sync-server', 'rcdrmd-sync-server.js');
 const DATASET_PATH = path.join(__dirname, '..', 'sync-server', 'rcdrmd-dataset.json');
-const SYNC_TOKEN = 'rcdrmd-local-sync-token';
-const AUTH_HEADERS = { 'Content-Type': 'application/json', 'X-RcdRmd-Token': SYNC_TOKEN };
 
 async function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -36,7 +34,7 @@ async function runTests() {
   try {
     // 2. Test status endpoint
     console.log('\n[Test 1] Checking server status...');
-    const statusRes = await fetch('http://127.0.0.1:32188/api/status', { headers: { 'X-RcdRmd-Token': SYNC_TOKEN } });
+    const statusRes = await fetch('http://127.0.0.1:32188/api/status');
     const statusData = await statusRes.json();
     console.log('Status response:', statusData);
     if (statusData.status !== 'online') throw new Error('Status not online');
@@ -74,7 +72,7 @@ async function runTests() {
 
     const edgeSyncRes = await fetch('http://127.0.0.1:32188/api/sync', {
       method: 'POST',
-      headers: AUTH_HEADERS,
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         browser: 'Microsoft Edge',
         windows: {
@@ -94,7 +92,7 @@ async function runTests() {
     console.log('\n[Test 3] Simulating Google Chrome tab sync...');
     const chromeSyncRes = await fetch('http://127.0.0.1:32188/api/sync', {
       method: 'POST',
-      headers: AUTH_HEADERS,
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         browser: 'Google Chrome',
         windows: { 'Default': 2 },
@@ -114,7 +112,7 @@ async function runTests() {
     console.log('\n[Test 4] Simulating Edge reporting deleted video in "Dev" workspace...');
     const edgeReportDeletedRes = await fetch('http://127.0.0.1:32188/api/sync', {
       method: 'POST',
-      headers: AUTH_HEADERS,
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         browser: 'Microsoft Edge',
         windows: {
@@ -145,7 +143,7 @@ async function runTests() {
     console.log('\n[Test 5] Simulating Canary receiving the deleted video...');
     const canarySyncRes = await fetch('http://127.0.0.1:32188/api/sync', {
       method: 'POST',
-      headers: AUTH_HEADERS,
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         browser: 'Google Chrome Canary',
         windows: { 'Default': 1 },
