@@ -1,6 +1,6 @@
 <div align="center">
 
-# RcdRmd (Record & Remind)
+# RcdRmd (Record what's been Removed)
 
 <img src="icons/icon-128.png" width="96" height="96" alt="RcdRmd Logo" />
 
