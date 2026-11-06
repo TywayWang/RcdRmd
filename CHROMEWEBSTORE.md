@@ -12,12 +12,13 @@
 
 | Permission | Reason |
 | :--- | :--- |
-| `tabs` | Required to query currently open tabs, detect when a Bilibili video tab navigates or redirects to the homepage/404, and read video page titles and URLs. |
+| `tabs` | Required to query currently open tabs, detect when a Bilibili video tab navigates or redirects to the homepage/error page, and read video page titles and URLs. |
 | `storage` | Required to persist the dataset of tracked tabs, deleted video records, and user preferences locally in `chrome.storage.local`. |
-| `alarms` | Required to trigger the 30-minute periodic health check and cross-browser synchronization (`chrome.alarms.create('rcdrmd-30min-sync', { periodInMinutes: 30 })`). |
-| `*://*.bilibili.com/*` | Required to inject the content script on Bilibili video pages and query Bilibili's public view API (`api.bilibili.com/x/web-interface/view`) to fetch title/channel metadata and verify video availability. |
-| `http://127.0.0.1/*` & `http://localhost/*` | Required to communicate with the local synchronization hub at `http://127.0.0.1:32188` to synchronize open tabs across Edge, Chrome, and Canary. |
+| `alarms` | Required to trigger the 30-minute periodic adjacent dataset cross-check and cross-browser synchronization (`chrome.alarms.create('rcdrmd-30min-sync', { periodInMinutes: 30 })`). |
+| `history` | Required as a fallback to recover the original video title from local browser history (`chrome.history.search`) if a sleeping or discarded Bilibili video tab had its title overwritten by an error message before removal. |
+| `*://*.bilibili.com/*` | Required to inject the content script on Bilibili video pages to extract video title/UP主 metadata from the DOM and detect video deletion/error states (`"视频去哪儿了？"`). |
+| `http://127.0.0.1/*` & `http://localhost/*` | Required to communicate with the optional local synchronization hub at `http://127.0.0.1:32188` to synchronize open tabs across Edge, Chrome, and Canary. |
 
 ## Privacy & Data Use
 - **Data Collection**: No personal user data or history is sent to any external server. All tab titles, channels, and deleted video records are stored strictly on the user's local machine (`chrome.storage.local` and `sync-server/rcdrmd-dataset.json`).
-- **Data Transmission**: None outside `localhost:32188` and public Bilibili view API queries.
+- **Data Transmission**: None outside `localhost:32188`.

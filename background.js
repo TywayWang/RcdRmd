@@ -5,6 +5,7 @@
  */
 
 const SYNC_SERVER_DEFAULT_URL = 'http://127.0.0.1:32188';
+const SYNC_TOKEN = 'rcdrmd-local-sync-token';
 
 // Detect browser identity (Edge, Chrome Canary, or Chrome)
 async function getBrowserName() {
@@ -30,23 +31,13 @@ async function getBrowserName() {
 }
 
 // Get or auto-assign a workspace/window name
-async function getWorkspaceName(windowId, tabCount = 0) {
+async function getWorkspaceName(windowId) {
   const { windowNames = {} } = await chrome.storage.local.get('windowNames');
   if (windowNames[windowId]) {
     return windowNames[windowId];
   }
 
-  // Smart default assignment based on user setup (e.g., Mixed has ~152 tabs, Dev has ~68 tabs)
-  let assigned = '';
-  const existingNames = Object.values(windowNames);
-  if (!existingNames.includes('Mixed') && tabCount >= 100) {
-    assigned = 'Mixed';
-  } else if (!existingNames.includes('Dev') && tabCount > 0 && tabCount < 100) {
-    assigned = 'Dev';
-  } else {
-    assigned = `工作区 ${windowId}`;
-  }
-
+  const assigned = `工作区 ${windowId}`;
   windowNames[windowId] = assigned;
   await chrome.storage.local.set({ windowNames });
   return assigned;
@@ -61,6 +52,153 @@ function cleanTitle(text) {
     .replace(/ - 哔哩哔哩.*/i, '')
     .replace(/ - bilibili.*/i, '')
     .trim();
+}
+
+// Error title patterns representing Bilibili video deletion / removal pages
+const ERROR_TITLE_PATTERNS = [
+  /^视频去哪[了儿呢\?？\s]*$/i,
+  /^啊叻[？\?]?\s*视频不见了.*/i,
+  /^(404(\s*not\s*found)?|404|bilibili-404|404-bilibili|出错了(\s*-\s*bilibili\.com)?)$/i,
+  /^(稿件不可见|该稿件已被下架|稿件已被UP主删除|抱歉[，,].*已被删除|非常抱歉.*|该内容已不存在)$/i,
+  /^(原视频已失效|视频已失效|该视频已失效|已失效|视频不存在|原视频不存在|视频不见了)$/i,
+  /^(已删除的B站视频|Unknown Video Title|（原视频标题未获取）|原视频标题未获取|（未获取到标题）|未获取到标题)$/i,
+  /^(B站视频|B站页面|B站标签页|B站首页)$/i
+];
+
+// Check if text indicates a removed/deleted video or error state
+function isDeletedOrErrorText(text) {
+  if (!text) return false;
+  const raw = text.trim();
+  const cleaned = cleanTitle(raw);
+  for (const pat of ERROR_TITLE_PATTERNS) {
+    if (pat.test(raw) || (cleaned && pat.test(cleaned))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Check if title is a valid, real video title
+function isValidVideoTitle(text) {
+  if (!text) return false;
+  const t = cleanTitle(text);
+  if (!t) return false;
+  if (
+    t === 'B站视频' ||
+    t === 'B站页面' ||
+    t === 'B站标签页' ||
+    t === 'B站首页' ||
+    t.startsWith('哔哩哔哩') ||
+    t.startsWith('bilibili')
+  ) {
+    return false;
+  }
+  return !isDeletedOrErrorText(t);
+}
+
+// Search browser history for original video title if local memory was lost
+async function lookupTitleFromBrowserHistory(bvid, originalUrl) {
+  if (typeof chrome === 'undefined' || !chrome.history || !chrome.history.search) {
+    return null;
+  }
+  return new Promise((resolve) => {
+    try {
+      const query = bvid || originalUrl || '';
+      if (!query) return resolve(null);
+      chrome.history.search({ text: query, maxResults: 20 }, (items) => {
+        if (!items || !items.length) return resolve(null);
+        for (const item of items) {
+          if (item.url && (item.url.includes(bvid) || (originalUrl && item.url === originalUrl))) {
+            const cleaned = cleanTitle(item.title);
+            if (isValidVideoTitle(cleaned)) {
+              return resolve(cleaned);
+            }
+          }
+        }
+        resolve(null);
+      });
+    } catch (e) {
+      resolve(null);
+    }
+  });
+}
+
+// Fully resolve video title and channel across all stores and history
+async function resolveTitleAndChannel(item, storageContext = null) {
+  const ctx = storageContext || await chrome.storage.local.get(['videoHistory', 'trackedTabs', 'lastSyncDataset', 'crossBrowserTabs']);
+  const videoHistory = ctx.videoHistory || {};
+  const trackedTabs = ctx.trackedTabs || {};
+  const lastSyncDataset = ctx.lastSyncDataset || {};
+  const crossBrowserTabs = ctx.crossBrowserTabs || [];
+
+  const bvid = item.bvid || extractBvid(item.originalUrl || item.url) || '';
+  const tabId = item.tabId;
+
+  let resolvedTitle = '';
+  if (isValidVideoTitle(item.title)) {
+    resolvedTitle = cleanTitle(item.title);
+  } else if (bvid && isValidVideoTitle(videoHistory[bvid]?.title)) {
+    resolvedTitle = videoHistory[bvid].title;
+  } else if (tabId && isValidVideoTitle(trackedTabs[tabId]?.title)) {
+    resolvedTitle = trackedTabs[tabId].title;
+  } else if (tabId && isValidVideoTitle(lastSyncDataset[tabId]?.title)) {
+    resolvedTitle = lastSyncDataset[tabId].title;
+  } else if (bvid) {
+    const foundTracked = Object.values(trackedTabs).find(t => t.bvid === bvid && isValidVideoTitle(t.title));
+    if (foundTracked) {
+      resolvedTitle = foundTracked.title;
+    } else {
+      const foundSync = Object.values(lastSyncDataset).find(t => t.bvid === bvid && isValidVideoTitle(t.title));
+      if (foundSync) {
+        resolvedTitle = foundSync.title;
+      } else {
+        const foundCross = crossBrowserTabs.find(t => t.bvid === bvid && isValidVideoTitle(t.title));
+        if (foundCross) {
+          resolvedTitle = foundCross.title;
+        }
+      }
+    }
+  }
+
+  // Fallback to browser history
+  if (!resolvedTitle && bvid) {
+    const histTitle = await lookupTitleFromBrowserHistory(bvid, item.originalUrl || item.url);
+    if (isValidVideoTitle(histTitle)) {
+      resolvedTitle = histTitle;
+    }
+  }
+
+  // Resolve channel
+  let resolvedChannel = '';
+  if (item.channel && item.channel !== '未知UP主') {
+    resolvedChannel = item.channel;
+  } else if (bvid && videoHistory[bvid]?.channel && videoHistory[bvid].channel !== '未知UP主') {
+    resolvedChannel = videoHistory[bvid].channel;
+  } else if (tabId && trackedTabs[tabId]?.channel && trackedTabs[tabId].channel !== '未知UP主') {
+    resolvedChannel = trackedTabs[tabId].channel;
+  } else if (tabId && lastSyncDataset[tabId]?.channel && lastSyncDataset[tabId].channel !== '未知UP主') {
+    resolvedChannel = lastSyncDataset[tabId].channel;
+  } else if (bvid) {
+    const foundTracked = Object.values(trackedTabs).find(t => t.bvid === bvid && t.channel && t.channel !== '未知UP主');
+    if (foundTracked) {
+      resolvedChannel = foundTracked.channel;
+    } else {
+      const foundSync = Object.values(lastSyncDataset).find(t => t.bvid === bvid && t.channel && t.channel !== '未知UP主');
+      if (foundSync) {
+        resolvedChannel = foundSync.channel;
+      } else {
+        const foundCross = crossBrowserTabs.find(t => t.bvid === bvid && t.channel && t.channel !== '未知UP主');
+        if (foundCross) {
+          resolvedChannel = foundCross.channel;
+        }
+      }
+    }
+  }
+
+  return {
+    title: resolvedTitle || (isValidVideoTitle(item.title) ? item.title : '（原视频标题未获取）'),
+    channel: resolvedChannel || '未知UP主'
+  };
 }
 
 // Extract BVID from URL
@@ -154,11 +292,26 @@ async function updateBadgeAndIcon() {
 
 // Record a deleted video into persistent storage
 async function recordDeletedVideo(deletedItem) {
-  const { deletedVideos = [], videoHistory = {} } = await chrome.storage.local.get(['deletedVideos', 'videoHistory']);
+  const { deletedVideos = [], videoHistory = {}, trackedTabs = {}, lastSyncDataset = {}, crossBrowserTabs = [] } =
+    await chrome.storage.local.get(['deletedVideos', 'videoHistory', 'trackedTabs', 'lastSyncDataset', 'crossBrowserTabs']);
 
-  if ((!deletedItem.title || deletedItem.title === 'Unknown Video Title' || deletedItem.title === '已删除的B站视频') && deletedItem.bvid && videoHistory[deletedItem.bvid]) {
-    deletedItem.title = videoHistory[deletedItem.bvid].title || deletedItem.title;
-    deletedItem.channel = videoHistory[deletedItem.bvid].channel || deletedItem.channel;
+  const bvid = deletedItem.bvid || extractBvid(deletedItem.originalUrl) || '';
+  const storageCtx = { videoHistory, trackedTabs, lastSyncDataset, crossBrowserTabs };
+
+  // Resolve true title & channel across all data stores
+  const resolved = await resolveTitleAndChannel(deletedItem, storageCtx);
+  deletedItem.title = resolved.title;
+  deletedItem.channel = resolved.channel;
+
+  // Cache genuine title in videoHistory so it is permanently preserved
+  if (bvid && isValidVideoTitle(deletedItem.title)) {
+    videoHistory[bvid] = {
+      bvid: bvid,
+      title: deletedItem.title,
+      channel: deletedItem.channel,
+      url: deletedItem.originalUrl || (bvid ? `https://www.bilibili.com/video/${bvid}` : ''),
+      lastSeen: new Date().toISOString()
+    };
   }
 
   const existingIdx = deletedVideos.findIndex(v =>
@@ -167,7 +320,7 @@ async function recordDeletedVideo(deletedItem) {
   );
 
   if (existingIdx >= 0) {
-    if (deletedItem.title && deletedItem.title !== '已删除的B站视频' && deletedItem.title !== 'Unknown Video Title') {
+    if (isValidVideoTitle(deletedItem.title)) {
       deletedVideos[existingIdx].title = deletedItem.title;
     }
     if (deletedItem.channel && deletedItem.channel !== '未知UP主') {
@@ -180,16 +333,41 @@ async function recordDeletedVideo(deletedItem) {
     deletedVideos.unshift(deletedItem);
   }
 
+  // Retroactive repair for previously corrupted records
+  for (const v of deletedVideos) {
+    if (!isValidVideoTitle(v.title)) {
+      const rep = await resolveTitleAndChannel(v, storageCtx);
+      if (isValidVideoTitle(rep.title)) {
+        v.title = rep.title;
+        if (v.bvid) {
+          videoHistory[v.bvid] = {
+            bvid: v.bvid,
+            title: rep.title,
+            channel: rep.channel || v.channel,
+            url: v.originalUrl || `https://www.bilibili.com/video/${v.bvid}`,
+            lastSeen: new Date().toISOString()
+          };
+        }
+      } else {
+        v.title = '（原视频标题未获取）';
+      }
+      if ((!v.channel || v.channel === '未知UP主') && rep.channel && rep.channel !== '未知UP主') {
+        v.channel = rep.channel;
+      }
+    }
+  }
+
   // Filter out any false HTTP 412 records
   const cleaned = deletedVideos.filter(v => {
     const r = (v.reason || '').toLowerCase();
     return !r.includes('http 412') && !r.includes('http 403') && !r.includes('http 429') && !r.includes('http 5');
   });
 
-  await chrome.storage.local.set({ deletedVideos: cleaned });
+  await chrome.storage.local.set({ deletedVideos: cleaned, videoHistory });
   await updateBadgeAndIcon();
   await syncWithServer();
 }
+
 
 // Synchronize dataset with local Sync Server
 async function syncWithServer() {
@@ -232,7 +410,10 @@ async function syncWithServer() {
 
     const response = await fetch(`${syncServerUrl}/api/sync`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-RcdRmd-Token': SYNC_TOKEN
+      },
       body: JSON.stringify(payload),
       signal: controller.signal
     });
@@ -253,6 +434,14 @@ async function syncWithServer() {
               acknowledged: false
             });
             hasNewDeleted = true;
+          } else {
+            if (!isValidVideoTitle(localDeleted[matchIdx].title) && isValidVideoTitle(serverItem.title)) {
+              localDeleted[matchIdx].title = cleanTitle(serverItem.title);
+            }
+            if ((!localDeleted[matchIdx].channel || localDeleted[matchIdx].channel === '未知UP主') &&
+                serverItem.channel && serverItem.channel !== '未知UP主') {
+              localDeleted[matchIdx].channel = serverItem.channel;
+            }
           }
         }
       }
@@ -271,6 +460,12 @@ async function syncWithServer() {
       }
 
       return { success: true, connected: true };
+    } else {
+      await chrome.storage.local.set({
+        syncServerStatus: 'offline',
+        lastSyncTime: new Date().toISOString()
+      });
+      return { success: false, connected: false, error: `HTTP ${response.status}` };
     }
   } catch (err) {
     await chrome.storage.local.set({
@@ -290,13 +485,15 @@ async function checkAllTabsHealth(triggerReason = 'periodic') {
     trackedTabs = {},
     videoHistory = {},
     deletedVideos = [],
-    windowNames = {}
+    windowNames = {},
+    crossBrowserTabs = []
   } = await chrome.storage.local.get([
     'lastSyncDataset',
     'trackedTabs',
     'videoHistory',
     'deletedVideos',
-    'windowNames'
+    'windowNames',
+    'crossBrowserTabs'
   ]);
 
   const browserName = await getBrowserName();
@@ -309,17 +506,15 @@ async function checkAllTabsHealth(triggerReason = 'periodic') {
   // First pass: count tabs per window and collect actual tabs
   for (const win of allWindows) {
     if (!win.tabs) continue;
-    let biliCount = 0;
     for (const tab of win.tabs) {
       actualTabMap.set(tab.id, tab);
       if (isBilibiliUrl(tab.url)) {
-        biliCount++;
         currentBiliTabs.push(tab);
       }
     }
     // Auto-detect or retrieve workspace name
     if (!windowNames[win.id]) {
-      windowNames[win.id] = await getWorkspaceName(win.id, biliCount);
+      windowNames[win.id] = await getWorkspaceName(win.id);
     }
   }
 
@@ -336,8 +531,27 @@ async function checkAllTabsHealth(triggerReason = 'periodic') {
     const wsName = windowNames[tab.windowId] || `工作区 ${tab.windowId}`;
 
     const prevTracked = trackedTabs[tabId] || lastSyncDataset[tabId] || {};
-    const title = cleanTitle(tab.title) || prevTracked.title || (videoHistory[bvid]?.title) || (isVideo ? 'B站视频' : 'B站页面');
-    const channel = prevTracked.channel || (videoHistory[bvid]?.channel) || '';
+    const rawCleanTitle = cleanTitle(tab.title);
+
+    // Resolve title: ONLY accept rawCleanTitle if it is a VALID title (not error text, not placeholder)
+    let title = '';
+    if (isValidVideoTitle(rawCleanTitle)) {
+      title = rawCleanTitle;
+    } else if (isValidVideoTitle(prevTracked.title)) {
+      title = prevTracked.title;
+    } else if (bvid && isValidVideoTitle(videoHistory[bvid]?.title)) {
+      title = videoHistory[bvid].title;
+    } else {
+      title = isVideo ? 'B站视频' : (isLanding ? 'B站首页' : 'B站页面');
+    }
+
+    const channel = (prevTracked.channel && prevTracked.channel !== '未知UP主')
+      ? prevTracked.channel
+      : (bvid && videoHistory[bvid]?.channel && videoHistory[bvid].channel !== '未知UP主')
+        ? videoHistory[bvid].channel
+        : '';
+
+    const isDeletedState = isDeletedOrErrorText(rawCleanTitle);
 
     const entry = {
       tabId: tab.id,
@@ -349,8 +563,9 @@ async function checkAllTabsHealth(triggerReason = 'periodic') {
       channel: channel,
       browser: browserName,
       isBilibiliTab: true,
-      isBilibiliVideo: isVideo,
+      isBilibiliVideo: isVideo && !isDeletedState,
       isLandingPage: isLanding,
+      isDeleted: isDeletedState,
       openedAt: prevTracked.openedAt || new Date().toISOString(),
       lastUpdated: new Date().toISOString()
     };
@@ -358,7 +573,7 @@ async function checkAllTabsHealth(triggerReason = 'periodic') {
     currentSyncDataset[tabId] = entry;
     updatedTrackedTabs[tabId] = entry;
 
-    if (bvid && title && isVideo && title !== 'B站视频') {
+    if (bvid && isVideo && isValidVideoTitle(title)) {
       videoHistory[bvid] = {
         bvid: bvid,
         title: title,
@@ -367,10 +582,58 @@ async function checkAllTabsHealth(triggerReason = 'periodic') {
         lastSeen: new Date().toISOString()
       };
     }
+
+    // If a video URL tab is currently showing an error/deleted title (e.g. after browser restart with new tabId)
+    // and was not previously recorded as an active video under this tabId in lastSyncDataset, ensure it is captured.
+    if (isVideo && isDeletedState && !(lastSyncDataset[tabId] && lastSyncDataset[tabId].isBilibiliVideo)) {
+      const resolved = await resolveTitleAndChannel({
+        tabId: tabId,
+        bvid: bvid,
+        originalUrl: url,
+        title: prevTracked.title,
+        channel: prevTracked.channel
+      }, { videoHistory, trackedTabs, lastSyncDataset, crossBrowserTabs });
+
+      if (bvid && isValidVideoTitle(resolved.title)) {
+        videoHistory[bvid] = {
+          bvid: bvid,
+          title: resolved.title,
+          channel: resolved.channel,
+          url: url,
+          lastSeen: new Date().toISOString()
+        };
+      }
+
+      const deletedItem = {
+        id: bvid || (`tab-${tabId}-${Date.now()}`),
+        bvid: bvid,
+        tabId: tabId,
+        title: resolved.title,
+        channel: resolved.channel,
+        browser: `${browserName} (${wsName})`,
+        originalUrl: url,
+        deletedAt: new Date().toISOString(),
+        reason: '原视频已失效/被删除 (页面显示“视频去哪儿了？”)',
+        acknowledged: false
+      };
+
+      const existingIdx = deletedVideos.findIndex(v => (v.bvid && bvid && v.bvid === bvid) || (v.id === deletedItem.id));
+      if (existingIdx >= 0) {
+        if (isValidVideoTitle(resolved.title)) {
+          deletedVideos[existingIdx].title = resolved.title;
+        }
+        if (resolved.channel && resolved.channel !== '未知UP主') {
+          deletedVideos[existingIdx].channel = resolved.channel;
+        }
+      } else {
+        deletedVideos.unshift(deletedItem);
+      }
+    }
   }
 
   // 2. CROSS-CHECK between two adjacent datasets (lastSyncDataset vs currentSyncDataset):
   // Detect if any tab was showing a video in lastSyncDataset, but is now a landing page
+  // or is showing "视频去哪儿了？"
   // Carefully handling edge cases:
   // - If user manually closed the tab: it's not in actualTabMap -> do NOT flag
   // - If user deliberately opened https://www.bilibili.com/ in a tab:
@@ -392,33 +655,64 @@ async function checkAllTabsHealth(triggerReason = 'periodic') {
         continue;
       }
 
-      // Tab is still open! Check if it now shows the landing page or error page
+      // Tab is still open! Check if it now shows the landing page or "视频去哪儿了？"
       const currUrl = currTab.url || '';
       const nowLanding = isLandingPageOrError(currUrl);
+      const nowDeletedText = isDeletedOrErrorText(currTab.title);
 
-      if (nowLanding) {
-        console.warn(`[RcdRmd] Adjacent dataset cross-check: Tab ${prevTabId} was "${prevRecord.title}" and now redirected to landing page!`);
+      if (nowLanding || nowDeletedText) {
+        console.warn(`[RcdRmd] Adjacent dataset cross-check: Tab ${prevTabId} was "${prevRecord.title}" and is now removed (landing: ${nowLanding}, deletedText: ${nowDeletedText})!`);
 
-        const bvid = prevRecord.bvid || '';
-        const title = prevRecord.title || videoHistory[bvid]?.title || '已删除的B站视频';
-        const channel = prevRecord.channel || videoHistory[bvid]?.channel || '未知UP主';
+        const bvid = prevRecord.bvid || extractBvid(prevRecord.url) || extractBvid(currUrl) || '';
+        const resolved = await resolveTitleAndChannel({
+          tabId: prevTabId,
+          bvid,
+          originalUrl: prevRecord.url,
+          title: prevRecord.title,
+          channel: prevRecord.channel
+        }, { videoHistory, trackedTabs, lastSyncDataset, crossBrowserTabs });
+
+        const title = resolved.title;
+        const channel = resolved.channel;
         const wsName = prevRecord.workspace || windowNames[prevRecord.windowId] || `工作区 ${prevRecord.windowId}`;
+
+        if (bvid && isValidVideoTitle(title)) {
+          videoHistory[bvid] = {
+            bvid: bvid,
+            title: title,
+            channel: channel,
+            url: prevRecord.url,
+            lastSeen: new Date().toISOString()
+          };
+        }
+
+        const reason = nowLanding
+          ? '原视频标签页已重定向至首页 (UP主删稿或被平台下架)'
+          : '原视频已失效/被删除 (页面显示“视频去哪儿了？”)';
 
         const deletedItem = {
           id: bvid || (`tab-${prevTabId}-${Date.now()}`),
           bvid: bvid,
+          tabId: prevTabId,
           title: title,
           channel: channel,
           browser: `${browserName} (${wsName})`,
           originalUrl: prevRecord.url,
           deletedAt: new Date().toISOString(),
-          reason: '原视频标签页已重定向至首页 (UP主删稿或被平台下架)',
+          reason: reason,
           acknowledged: false
         };
 
         const existingIdx = deletedVideos.findIndex(v => (v.bvid && bvid && v.bvid === bvid) || (v.id === deletedItem.id));
         if (existingIdx >= 0) {
+          if (isValidVideoTitle(title)) {
+            deletedVideos[existingIdx].title = title;
+          }
+          if (channel && channel !== '未知UP主') {
+            deletedVideos[existingIdx].channel = channel;
+          }
           deletedVideos[existingIdx].deletedAt = deletedItem.deletedAt;
+          deletedVideos[existingIdx].reason = deletedItem.reason;
           deletedVideos[existingIdx].acknowledged = false;
         } else {
           deletedVideos.unshift(deletedItem);
@@ -426,19 +720,34 @@ async function checkAllTabsHealth(triggerReason = 'periodic') {
 
         if (updatedTrackedTabs[prevTabId]) {
           updatedTrackedTabs[prevTabId].isBilibiliVideo = false;
-          updatedTrackedTabs[prevTabId].isLandingPage = true;
+          updatedTrackedTabs[prevTabId].isLandingPage = nowLanding;
+          updatedTrackedTabs[prevTabId].isDeleted = true;
         }
       }
     }
   }
 
-  // 3. Automated cleanup: purge legacy false "HTTP 412" or network errors from previous API check
+  // 3. Retroactive repair for any previously corrupted deleted video records
+  const storageCtx = { videoHistory, trackedTabs: updatedTrackedTabs, lastSyncDataset, crossBrowserTabs };
+  for (const v of deletedVideos) {
+    if (!isValidVideoTitle(v.title) || !v.channel || v.channel === '未知UP主') {
+      const rep = await resolveTitleAndChannel(v, storageCtx);
+      if (!isValidVideoTitle(v.title)) {
+        v.title = isValidVideoTitle(rep.title) ? rep.title : '（原视频标题未获取）';
+      }
+      if ((!v.channel || v.channel === '未知UP主') && rep.channel && rep.channel !== '未知UP主') {
+        v.channel = rep.channel;
+      }
+    }
+  }
+
+  // 4. Automated cleanup: purge legacy false "HTTP 412" or network errors from previous API check
   const cleanedDeletedVideos = deletedVideos.filter(v => {
     const r = (v.reason || '').toLowerCase();
     return !r.includes('http 412') && !r.includes('http 403') && !r.includes('http 429') && !r.includes('http 5');
   });
 
-  // 4. Persist datasets: currentSyncDataset becomes lastSyncDataset for the next 30-min comparison
+  // 5. Persist datasets: currentSyncDataset becomes lastSyncDataset for the next 30-min comparison
   await chrome.storage.local.set({
     lastSyncDataset: currentSyncDataset,
     trackedTabs: updatedTrackedTabs,
@@ -448,10 +757,10 @@ async function checkAllTabsHealth(triggerReason = 'periodic') {
     lastSyncTime: new Date().toISOString()
   });
 
-  // 5. Update badge and yellow icon
+  // 6. Update badge and yellow icon
   await updateBadgeAndIcon();
 
-  // 6. Push synchronized dataset to local hub
+  // 7. Push synchronized dataset to local hub
   await syncWithServer();
 }
 
@@ -499,34 +808,61 @@ chrome.windows.onRemoved.addListener(async (winId) => {
 
 // Tab Navigation Listener
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
-  if (!changeInfo.url && changeInfo.status !== 'complete') return;
+  if (!changeInfo.url && changeInfo.status !== 'complete' && !changeInfo.title) return;
 
   const currentUrl = tab.url || changeInfo.url || '';
   if (!currentUrl) return;
 
-  const { trackedTabs = {}, videoHistory = {}, windowNames = {} } =
-    await chrome.storage.local.get(['trackedTabs', 'videoHistory', 'windowNames']);
-  const prevTab = trackedTabs[tabId];
+  const { trackedTabs = {}, videoHistory = {}, windowNames = {}, lastSyncDataset = {}, crossBrowserTabs = [] } =
+    await chrome.storage.local.get(['trackedTabs', 'videoHistory', 'windowNames', 'lastSyncDataset', 'crossBrowserTabs']);
+  const prevTab = trackedTabs[tabId] || lastSyncDataset[tabId];
   const browserName = await getBrowserName();
   const wsName = windowNames[tab.windowId] || (prevTab ? prevTab.workspace : `工作区 ${tab.windowId}`);
+  const rawCleanTitle = cleanTitle(tab.title);
 
-  // DELETION DETECTION: Video tab was redirected to landing page or 404
-  if (prevTab && prevTab.isBilibiliVideo && isLandingPageOrError(currentUrl)) {
-    console.warn(`[RcdRmd] DELETION REDIRECT! Tab ${tabId} was ${prevTab.title} (${prevTab.bvid}) and redirected to homepage`);
+  // DELETION DETECTION: Video tab was redirected to landing page or error page, OR is now showing "视频去哪儿了？"
+  const isNowLanding = isLandingPageOrError(currentUrl);
+  const isNowErrorText = isDeletedOrErrorText(rawCleanTitle) || (changeInfo.title && isDeletedOrErrorText(cleanTitle(changeInfo.title)));
 
-    const bvid = prevTab.bvid || '';
-    const title = prevTab.title || videoHistory[bvid]?.title || '已删除的B站视频';
-    const channel = prevTab.channel || videoHistory[bvid]?.channel || '未知UP主';
+  if (prevTab && prevTab.isBilibiliVideo && (isNowLanding || isNowErrorText)) {
+    console.warn(`[RcdRmd] DELETION DETECTED! Tab ${tabId} was "${prevTab.title}" (${prevTab.bvid}), landing=${isNowLanding}, errorText=${isNowErrorText}`);
+
+    const bvid = prevTab.bvid || extractBvid(prevTab.url) || extractBvid(currentUrl) || '';
+    const resolved = await resolveTitleAndChannel({
+      tabId: tabId,
+      bvid: bvid,
+      originalUrl: prevTab.url || currentUrl,
+      title: prevTab.title,
+      channel: prevTab.channel
+    }, { videoHistory, trackedTabs, lastSyncDataset, crossBrowserTabs });
+
+    const title = resolved.title;
+    const channel = resolved.channel;
+
+    if (bvid && isValidVideoTitle(title)) {
+      videoHistory[bvid] = {
+        bvid: bvid,
+        title: title,
+        channel: channel,
+        url: prevTab.url || currentUrl,
+        lastSeen: new Date().toISOString()
+      };
+    }
+
+    const reason = isNowLanding
+      ? '原视频标签页已重定向至首页 (UP主删稿或被平台下架)'
+      : '原视频已失效/被删除 (页面显示“视频去哪儿了？”)';
 
     await recordDeletedVideo({
       id: bvid || ('tab-' + tabId + '-' + Date.now()),
       bvid: bvid,
+      tabId: tabId,
       title: title,
       channel: channel,
       browser: `${browserName} (${wsName})`,
-      originalUrl: prevTab.url,
+      originalUrl: prevTab.url || currentUrl,
       deletedAt: new Date().toISOString(),
-      reason: '原视频标签页已重定向至首页 (UP主删稿或被平台下架)',
+      reason: reason,
       acknowledged: false
     });
 
@@ -535,17 +871,18 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
       windowId: tab.windowId,
       workspace: wsName,
       url: currentUrl,
-      bvid: '',
-      title: 'B站首页',
-      channel: '',
+      bvid: bvid,
+      title: isNowLanding ? 'B站首页' : '视频已失效',
+      channel: channel,
       browser: browserName,
       isBilibiliTab: true,
       isBilibiliVideo: false,
-      isLandingPage: true,
+      isLandingPage: isNowLanding,
+      isDeleted: true,
       openedAt: prevTab.openedAt || new Date().toISOString(),
       lastUpdated: new Date().toISOString()
     };
-    await chrome.storage.local.set({ trackedTabs });
+    await chrome.storage.local.set({ trackedTabs, videoHistory });
     await updateBadgeAndIcon();
     return;
   }
@@ -555,8 +892,81 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
     const bvid = extractBvid(currentUrl);
     const isVideo = isBilibiliVideoUrl(currentUrl);
     const isLanding = isLandingPageOrError(currentUrl);
-    const existingTitle = cleanTitle(tab.title) || prevTab?.title || videoHistory[bvid]?.title || (isVideo ? 'B站视频' : 'B站页面');
-    const existingChannel = prevTab?.channel || videoHistory[bvid]?.channel || '';
+
+    // If it's a video URL, but page displays "视频去哪儿了？" / "视频去哪了呢？"
+    if (isVideo && isDeletedOrErrorText(rawCleanTitle)) {
+      const resolved = await resolveTitleAndChannel({
+        tabId: tabId,
+        bvid: bvid,
+        originalUrl: currentUrl,
+        title: prevTab?.title,
+        channel: prevTab?.channel
+      }, { videoHistory, trackedTabs, lastSyncDataset, crossBrowserTabs });
+
+      const title = resolved.title;
+      const channel = resolved.channel;
+
+      if (bvid && isValidVideoTitle(title)) {
+        videoHistory[bvid] = {
+          bvid: bvid,
+          title: title,
+          channel: channel,
+          url: currentUrl,
+          lastSeen: new Date().toISOString()
+        };
+      }
+
+      await recordDeletedVideo({
+        id: bvid || ('tab-' + tabId + '-' + Date.now()),
+        bvid: bvid,
+        tabId: tabId,
+        title: title,
+        channel: channel,
+        browser: `${browserName} (${wsName})`,
+        originalUrl: currentUrl,
+        deletedAt: new Date().toISOString(),
+        reason: '原视频已失效/被删除 (页面显示“视频去哪儿了？”)',
+        acknowledged: false
+      });
+
+      trackedTabs[tabId] = {
+        tabId: tab.id,
+        windowId: tab.windowId,
+        workspace: wsName,
+        url: currentUrl,
+        bvid: bvid,
+        title: '视频已失效',
+        channel: channel,
+        browser: browserName,
+        isBilibiliTab: true,
+        isBilibiliVideo: false,
+        isLandingPage: false,
+        isDeleted: true,
+        openedAt: prevTab?.openedAt || new Date().toISOString(),
+        lastUpdated: new Date().toISOString()
+      };
+      await chrome.storage.local.set({ trackedTabs });
+      await updateBadgeAndIcon();
+      return;
+    }
+
+    // Normal healthy tab: resolve title
+    let resolvedTitle = '';
+    if (isValidVideoTitle(rawCleanTitle)) {
+      resolvedTitle = rawCleanTitle;
+    } else if (prevTab && isValidVideoTitle(prevTab.title)) {
+      resolvedTitle = prevTab.title;
+    } else if (bvid && isValidVideoTitle(videoHistory[bvid]?.title)) {
+      resolvedTitle = videoHistory[bvid].title;
+    } else {
+      resolvedTitle = isVideo ? 'B站视频' : 'B站页面';
+    }
+
+    const existingChannel = (prevTab?.channel && prevTab.channel !== '未知UP主')
+      ? prevTab.channel
+      : (bvid && videoHistory[bvid]?.channel)
+        ? videoHistory[bvid].channel
+        : '';
 
     trackedTabs[tabId] = {
       tabId: tab.id,
@@ -564,7 +974,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
       workspace: wsName,
       url: currentUrl,
       bvid: bvid,
-      title: existingTitle,
+      title: resolvedTitle,
       channel: existingChannel,
       browser: browserName,
       isBilibiliTab: true,
@@ -574,10 +984,10 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
       lastUpdated: new Date().toISOString()
     };
 
-    if (bvid && existingTitle && isVideo && existingTitle !== 'B站视频') {
+    if (bvid && isVideo && isValidVideoTitle(resolvedTitle)) {
       videoHistory[bvid] = {
         bvid: bvid,
-        title: existingTitle,
+        title: resolvedTitle,
         channel: existingChannel,
         url: currentUrl,
         lastSeen: new Date().toISOString()
@@ -618,8 +1028,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const bvid = meta.bvid || extractBvid(meta.url || sender.tab.url);
         const wsName = windowNames[sender.tab.windowId] || `工作区 ${sender.tab.windowId}`;
 
-        const cleanT = cleanTitle(meta.title) || trackedTabs[tabId]?.title || cleanTitle(sender.tab.title);
-        const channel = meta.channel || trackedTabs[tabId]?.channel || '';
+        // Reject any error text or invalid title
+        let cleanT = '';
+        if (isValidVideoTitle(meta.title)) {
+          cleanT = cleanTitle(meta.title);
+        } else if (trackedTabs[tabId] && isValidVideoTitle(trackedTabs[tabId].title)) {
+          cleanT = trackedTabs[tabId].title;
+        } else if (isValidVideoTitle(sender.tab.title)) {
+          cleanT = cleanTitle(sender.tab.title);
+        } else if (bvid && isValidVideoTitle(videoHistory[bvid]?.title)) {
+          cleanT = videoHistory[bvid].title;
+        }
+
+        const channel = (meta.channel && meta.channel !== '未知UP主')
+          ? meta.channel
+          : (trackedTabs[tabId]?.channel && trackedTabs[tabId].channel !== '未知UP主')
+            ? trackedTabs[tabId].channel
+            : (bvid && videoHistory[bvid]?.channel)
+              ? videoHistory[bvid].channel
+              : '';
 
         trackedTabs[tabId] = {
           tabId: tabId,
@@ -627,7 +1054,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           workspace: wsName,
           url: meta.url || sender.tab.url,
           bvid: bvid,
-          title: cleanT,
+          title: cleanT || (isBilibiliVideoUrl(meta.url || sender.tab.url) ? 'B站视频' : 'B站页面'),
           channel: channel,
           browser: browserName,
           isBilibiliTab: true,
@@ -636,7 +1063,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           lastUpdated: new Date().toISOString()
         };
 
-        if (bvid && cleanT) {
+        if (bvid && isValidVideoTitle(cleanT)) {
           videoHistory[bvid] = {
             bvid: bvid,
             title: cleanT,
@@ -654,31 +1081,52 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case 'VIDEO_DELETED_DETECTED': {
         const meta = message.data || {};
         const bvid = meta.bvid || extractBvid(meta.url);
-        const { videoHistory = {}, trackedTabs = {}, windowNames = {} } =
-          await chrome.storage.local.get(['videoHistory', 'trackedTabs', 'windowNames']);
+        const { videoHistory = {}, trackedTabs = {}, windowNames = {}, lastSyncDataset = {}, crossBrowserTabs = [] } =
+          await chrome.storage.local.get(['videoHistory', 'trackedTabs', 'windowNames', 'lastSyncDataset', 'crossBrowserTabs']);
 
-        const winId = (sender.tab && sender.tab.windowId) || 0;
-        const wsName = windowNames[winId] || (sender.tab ? `工作区 ${winId}` : '');
+        const tab = sender.tab;
+        const tabId = tab ? tab.id : null;
+        const prevTab = tabId ? (trackedTabs[tabId] || lastSyncDataset[tabId]) : null;
 
-        const tabTitle = (sender.tab && sender.tab.id && trackedTabs[sender.tab.id]?.title) ||
-                         videoHistory[bvid]?.title ||
-                         cleanTitle(sender.tab?.title) ||
-                         '已删除的B站视频';
-        const tabChannel = (sender.tab && sender.tab.id && trackedTabs[sender.tab.id]?.channel) ||
-                           videoHistory[bvid]?.channel ||
-                           '未知UP主';
+        const winId = (tab && tab.windowId) || (prevTab ? prevTab.windowId : 0);
+        const wsName = windowNames[winId] || (prevTab ? prevTab.workspace : (winId ? `工作区 ${winId}` : ''));
+
+        const resolved = await resolveTitleAndChannel({
+          tabId: tabId,
+          bvid: bvid,
+          originalUrl: meta.url || (tab && tab.url) || (prevTab && prevTab.url) || '',
+          title: (prevTab && prevTab.title) || (tab && tab.title),
+          channel: (prevTab && prevTab.channel)
+        }, { videoHistory, trackedTabs, lastSyncDataset, crossBrowserTabs });
+
+        if (bvid && isValidVideoTitle(resolved.title)) {
+          videoHistory[bvid] = {
+            bvid: bvid,
+            title: resolved.title,
+            channel: resolved.channel,
+            url: meta.url || (tab && tab.url) || `https://www.bilibili.com/video/${bvid}`,
+            lastSeen: new Date().toISOString()
+          };
+        }
 
         await recordDeletedVideo({
           id: bvid || ('deleted-' + Date.now()),
           bvid: bvid,
-          title: tabTitle,
-          channel: tabChannel,
+          tabId: tabId,
+          title: resolved.title,
+          channel: resolved.channel,
           browser: wsName ? `${browserName} (${wsName})` : browserName,
-          originalUrl: meta.url || (sender.tab && sender.tab.url) || '',
+          originalUrl: meta.url || (tab && tab.url) || (prevTab && prevTab.url) || '',
           deletedAt: new Date().toISOString(),
-          reason: meta.reason || '页面检测显示视频已被删除/下架',
+          reason: meta.reason || '原视频已失效/被删除 (页面显示“视频去哪儿了？”)',
           acknowledged: false
         });
+
+        if (tabId && trackedTabs[tabId]) {
+          trackedTabs[tabId].isBilibiliVideo = false;
+          trackedTabs[tabId].isDeleted = true;
+          await chrome.storage.local.set({ trackedTabs, videoHistory });
+        }
 
         sendResponse({ success: true });
         break;
@@ -687,18 +1135,38 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case 'LANDING_PAGE_ACTIVE': {
         if (sender.tab && sender.tab.id) {
           const tabId = sender.tab.id;
-          const { trackedTabs = {}, videoHistory = {}, windowNames = {}, lastSyncDataset = {} } =
-            await chrome.storage.local.get(['trackedTabs', 'videoHistory', 'windowNames', 'lastSyncDataset']);
+          const { trackedTabs = {}, videoHistory = {}, windowNames = {}, lastSyncDataset = {}, crossBrowserTabs = [] } =
+            await chrome.storage.local.get(['trackedTabs', 'videoHistory', 'windowNames', 'lastSyncDataset', 'crossBrowserTabs']);
           const prevTab = trackedTabs[tabId] || lastSyncDataset[tabId];
 
           if (prevTab && prevTab.isBilibiliVideo) {
-            const bvid = prevTab.bvid;
+            const bvid = prevTab.bvid || extractBvid(prevTab.url) || '';
             const wsName = windowNames[sender.tab.windowId] || prevTab.workspace || `工作区 ${sender.tab.windowId}`;
+
+            const resolved = await resolveTitleAndChannel({
+              tabId: tabId,
+              bvid: bvid,
+              originalUrl: prevTab.url,
+              title: prevTab.title,
+              channel: prevTab.channel
+            }, { videoHistory, trackedTabs, lastSyncDataset, crossBrowserTabs });
+
+            if (bvid && isValidVideoTitle(resolved.title)) {
+              videoHistory[bvid] = {
+                bvid: bvid,
+                title: resolved.title,
+                channel: resolved.channel,
+                url: prevTab.url,
+                lastSeen: new Date().toISOString()
+              };
+            }
+
             await recordDeletedVideo({
               id: bvid || ('tab-' + tabId + '-' + Date.now()),
               bvid: bvid,
-              title: prevTab.title || videoHistory[bvid]?.title || '已删除的B站视频',
-              channel: prevTab.channel || videoHistory[bvid]?.channel || '未知UP主',
+              tabId: tabId,
+              title: resolved.title,
+              channel: resolved.channel,
               browser: `${browserName} (${wsName})`,
               originalUrl: prevTab.url,
               deletedAt: new Date().toISOString(),
@@ -711,9 +1179,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               url: message.url || 'https://www.bilibili.com/',
               isBilibiliVideo: false,
               isLandingPage: true,
+              isDeleted: true,
               lastUpdated: new Date().toISOString()
             };
-            await chrome.storage.local.set({ trackedTabs });
+            await chrome.storage.local.set({ trackedTabs, videoHistory });
             await updateBadgeAndIcon();
           }
         }
@@ -726,6 +1195,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           'trackedTabs',
           'deletedVideos',
           'crossBrowserTabs',
+          'videoHistory',
           'lastSyncTime',
           'syncServerStatus',
           'customBrowserName',

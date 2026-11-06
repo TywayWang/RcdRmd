@@ -22,7 +22,8 @@
   "permissions": [
     "tabs",
     "storage",
-    "alarms"
+    "alarms",
+    "history"
   ],
   "host_permissions": [
     "*://*.bilibili.com/*",

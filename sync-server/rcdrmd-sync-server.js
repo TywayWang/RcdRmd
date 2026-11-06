@@ -8,8 +8,66 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
-const PORT = 32188;
-const DATASET_FILE = path.join(__dirname, 'rcdrmd-dataset.json');
+const PORT = parseInt(process.env.RCDRMD_PORT, 10) || 32188;
+const DATASET_FILE = process.env.RCDRMD_DATASET_FILE || path.join(__dirname, 'rcdrmd-dataset.json');
+
+// Shared token that must accompany every data request.
+// The real hardening is localhost-only binding; this token blocks casual
+// drive-by requests from arbitrary web pages that don't know it.
+const SYNC_TOKEN = 'rcdrmd-local-sync-token';
+
+function isValidToken(req) {
+  return req.headers['x-rcdrmd-token'] === SYNC_TOKEN;
+}
+
+function cleanTitle(text) {
+  if (!text) return '';
+  return text
+    .replace(/_哔哩哔哩_bilibili.*/i, '')
+    .replace(/_哔哩哔哩.*/i, '')
+    .replace(/ - 哔哩哔哩.*/i, '')
+    .replace(/ - bilibili.*/i, '')
+    .trim();
+}
+
+const ERROR_TITLE_PATTERNS = [
+  /^视频去哪[了儿呢\?？\s]*$/i,
+  /^啊叻[？\?]?\s*视频不见了.*/i,
+  /^(404(\s*not\s*found)?|404|bilibili-404|404-bilibili|出错了(\s*-\s*bilibili\.com)?)$/i,
+  /^(稿件不可见|该稿件已被下架|稿件已被UP主删除|抱歉[，,].*已被删除|非常抱歉.*|该内容已不存在)$/i,
+  /^(原视频已失效|视频已失效|该视频已失效|已失效|视频不存在|原视频不存在|视频不见了)$/i,
+  /^(已删除的B站视频|Unknown Video Title|（原视频标题未获取）|原视频标题未获取|（未获取到标题）|未获取到标题)$/i,
+  /^(B站视频|B站页面|B站标签页|B站首页)$/i
+];
+
+function isDeletedOrErrorText(text) {
+  if (!text) return false;
+  const raw = text.trim();
+  const cleaned = cleanTitle(raw);
+  for (const pat of ERROR_TITLE_PATTERNS) {
+    if (pat.test(raw) || (cleaned && pat.test(cleaned))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isValidVideoTitle(text) {
+  if (!text) return false;
+  const t = cleanTitle(text);
+  if (!t) return false;
+  if (
+    t === 'B站视频' ||
+    t === 'B站页面' ||
+    t === 'B站标签页' ||
+    t === 'B站首页' ||
+    t.startsWith('哔哩哔哩') ||
+    t.startsWith('bilibili')
+  ) {
+    return false;
+  }
+  return !isDeletedOrErrorText(t);
+}
 
 function loadDataset() {
   try {
@@ -43,14 +101,19 @@ function saveDataset(data) {
 
 let dataset = loadDataset();
 
-function setCorsHeaders(res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
+function setCorsHeaders(req, res) {
+  // Only reflect the origin when the caller presents a valid token.
+  // The extension talks to this server via its `host_permissions`, so it
+  // bypasses CORS entirely and is unaffected by this tightening.
+  if (isValidToken(req)) {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+  }
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept, X-RcdRmd-Token');
 }
 
 const server = http.createServer((req, res) => {
-  setCorsHeaders(res);
+  setCorsHeaders(req, res);
 
   if (req.method === 'OPTIONS') {
     res.writeHead(204);
@@ -59,6 +122,15 @@ const server = http.createServer((req, res) => {
   }
 
   const url = new URL(req.url, `http://localhost:${PORT}`);
+
+  // Authentication check: require the shared token on every data endpoint.
+  // Without it, an arbitrary web page cannot read the dataset or inject
+  // polluting records via a no-cors form/body POST.
+  if ((req.method === 'GET' || req.method === 'POST') && !isValidToken(req)) {
+    res.writeHead(401, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Unauthorized: missing or invalid X-RcdRmd-Token' }));
+    return;
+  }
 
   // Route: GET /api/status
   if (req.method === 'GET' && url.pathname === '/api/status') {
@@ -76,7 +148,7 @@ const server = http.createServer((req, res) => {
       activeBrowsers,
       totalTabsAcrossBrowsers: totalTabs,
       totalDeletedVideos: (dataset.deletedVideos || []).length,
-      datasetPath: DATASET_FILE,
+      datasetFile: path.basename(DATASET_FILE),
       updatedAt: dataset.updatedAt
     }));
     return;
@@ -119,7 +191,7 @@ const server = http.createServer((req, res) => {
         // 2. Cache tracked video titles in history
         if (!dataset.allTrackedHistory) dataset.allTrackedHistory = {};
         incomingTabs.forEach(t => {
-          if (t.bvid && t.title) {
+          if (t.bvid && t.title && isValidVideoTitle(t.title)) {
             dataset.allTrackedHistory[t.bvid] = {
               title: t.title,
               channel: t.channel || '',
@@ -137,6 +209,14 @@ const server = http.createServer((req, res) => {
           if (r.includes('http 412') || r.includes('http 403') || r.includes('http 429') || r.includes('http 5')) {
             return;
           }
+
+          if (!isValidVideoTitle(delItem.title) && delItem.bvid && dataset.allTrackedHistory && isValidVideoTitle(dataset.allTrackedHistory[delItem.bvid]?.title)) {
+            delItem.title = dataset.allTrackedHistory[delItem.bvid].title;
+          }
+          if ((!delItem.channel || delItem.channel === '未知UP主') && delItem.bvid && dataset.allTrackedHistory?.[delItem.bvid]?.channel) {
+            delItem.channel = dataset.allTrackedHistory[delItem.bvid].channel;
+          }
+
           const matchIdx = dataset.deletedVideos.findIndex(v =>
             (v.bvid && delItem.bvid && v.bvid === delItem.bvid) ||
             (v.id && delItem.id && v.id === delItem.id)
@@ -149,10 +229,12 @@ const server = http.createServer((req, res) => {
             });
             console.log(`[Sync Server] ⚠️ Registered DELETED video from ${browserName}: "${delItem.title}" (${delItem.channel})`);
           } else {
-            if (delItem.title && delItem.title !== '已删除的B站视频' && delItem.title !== 'Deleted Bilibili Video') {
+            if (isValidVideoTitle(delItem.title)) {
               dataset.deletedVideos[matchIdx].title = delItem.title;
+            } else if (!isValidVideoTitle(dataset.deletedVideos[matchIdx].title) && delItem.bvid && dataset.allTrackedHistory && isValidVideoTitle(dataset.allTrackedHistory[delItem.bvid]?.title)) {
+              dataset.deletedVideos[matchIdx].title = dataset.allTrackedHistory[delItem.bvid].title;
             }
-            if (delItem.channel) {
+            if (delItem.channel && delItem.channel !== '未知UP主') {
               dataset.deletedVideos[matchIdx].channel = delItem.channel;
             }
           }
@@ -161,6 +243,15 @@ const server = http.createServer((req, res) => {
         dataset.deletedVideos = dataset.deletedVideos.filter(v => {
           const r = (v.reason || '').toLowerCase();
           return !r.includes('http 412') && !r.includes('http 403') && !r.includes('http 429') && !r.includes('http 5');
+        });
+
+        dataset.deletedVideos.forEach(v => {
+          if (!isValidVideoTitle(v.title) && v.bvid && dataset.allTrackedHistory && isValidVideoTitle(dataset.allTrackedHistory[v.bvid]?.title)) {
+            v.title = dataset.allTrackedHistory[v.bvid].title;
+          }
+          if ((!v.channel || v.channel === '未知UP主') && v.bvid && dataset.allTrackedHistory?.[v.bvid]?.channel && dataset.allTrackedHistory[v.bvid].channel !== '未知UP主') {
+            v.channel = dataset.allTrackedHistory[v.bvid].channel;
+          }
         });
 
         saveDataset(dataset);
@@ -201,7 +292,7 @@ server.listen(PORT, '127.0.0.1', () => {
   console.log('====================================================');
   console.log(`  RcdRmd Local Cross-Browser Sync Hub`);
   console.log(`  Running on: http://127.0.0.1:${PORT}`);
-  console.log(`  Dataset storage: ${DATASET_FILE}`);
+  console.log(`  Dataset storage: ${path.basename(DATASET_FILE)}`);
   console.log(`  Ready for Microsoft Edge, Chrome & Chrome Canary`);
   console.log('====================================================');
 });

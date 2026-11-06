@@ -8,7 +8,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   let appState = {
     currentBrowser: 'Microsoft Edge',
     currentWindowId: null,
-    currentWorkspaceName: 'Dev',
+    currentWorkspaceName: '默认工作区',
     allWindows: [],
     windowNames: {},
     trackedTabs: {},
@@ -108,25 +108,62 @@ document.addEventListener('DOMContentLoaded', async () => {
 
       // 3. Resolve Workspace Names for all windows
       const windowNames = appState.windowNames || {};
-      const existingAssigned = Object.values(windowNames);
-
       allWins.forEach(win => {
-        const biliCount = (win.tabs || []).filter(t => isBiliUrl(t.url)).length;
         if (!windowNames[win.id]) {
-          // Smart default: if tabs >= 100 and Mixed not assigned, use Mixed; if tabs < 100, use Dev
-          if (biliCount >= 100 && !existingAssigned.includes('Mixed')) {
-            windowNames[win.id] = 'Mixed';
-            existingAssigned.push('Mixed');
-          } else if (biliCount > 0 && biliCount < 100 && !existingAssigned.includes('Dev')) {
-            windowNames[win.id] = 'Dev';
-            existingAssigned.push('Dev');
-          } else {
-            windowNames[win.id] = `工作区 ${win.id}`;
-          }
+          windowNames[win.id] = `工作区 ${win.id}`;
         }
       });
       appState.windowNames = windowNames;
       appState.currentWorkspaceName = windowNames[currentWin.id] || `工作区 ${currentWin.id}`;
+
+      // 4. Retroactive title repair for UI state
+      if (Array.isArray(appState.deletedVideos)) {
+        let changed = false;
+        for (const v of appState.deletedVideos) {
+          if (!isValidVideoTitle(v.title)) {
+            if (v.bvid && appState.videoHistory && isValidVideoTitle(appState.videoHistory[v.bvid]?.title)) {
+              v.title = appState.videoHistory[v.bvid].title;
+              changed = true;
+            }
+            if (!isValidVideoTitle(v.title) && v.bvid && appState.trackedTabs) {
+              const f = Object.values(appState.trackedTabs).find(t => t.bvid === v.bvid && isValidVideoTitle(t.title));
+              if (f) {
+                v.title = f.title;
+                changed = true;
+              }
+            }
+            if (!isValidVideoTitle(v.title) && v.bvid && Array.isArray(appState.crossBrowserTabs)) {
+              const fc = appState.crossBrowserTabs.find(t => t.bvid === v.bvid && isValidVideoTitle(t.title));
+              if (fc) {
+                v.title = cleanTitle(fc.title);
+                changed = true;
+              }
+            }
+            if (!isValidVideoTitle(v.title) && typeof chrome !== 'undefined' && chrome.history && chrome.history.search && v.bvid) {
+              try {
+                const histItems = await chrome.history.search({ text: v.bvid, maxResults: 10 });
+                for (const h of (histItems || [])) {
+                  if (h.url && h.url.includes(v.bvid)) {
+                    const ct = cleanTitle(h.title);
+                    if (isValidVideoTitle(ct)) {
+                      v.title = ct;
+                      changed = true;
+                      break;
+                    }
+                  }
+                }
+              } catch (e) {}
+            }
+          }
+          if ((!v.channel || v.channel === '未知UP主') && v.bvid && appState.videoHistory?.[v.bvid]?.channel) {
+            v.channel = appState.videoHistory[v.bvid].channel;
+            changed = true;
+          }
+        }
+        if (changed) {
+          await chrome.storage.local.set({ deletedVideos: appState.deletedVideos });
+        }
+      }
 
       renderAll();
     } catch (err) {
@@ -152,9 +189,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     currentWorkspaceName.textContent = appState.currentWorkspaceName;
     currentWorkspaceCount.textContent = `(${currentWinBiliTabs.length})`;
 
-    // Nav Badge for Active Tabs: SHOW CURRENT WINDOW'S COUNT (e.g. 68 in Dev!)
+    // Nav Badge for Active Tabs: show current window's Bilibili tab count
     tabsBadge.textContent = currentWinBiliTabs.length;
-    tabsBadge.title = `当前工作区 (${appState.currentWorkspaceName}): ${currentWinBiliTabs.length} 标签 | 所有Edge工作区: ${totalLocalBiliTabs} 标签`;
+    tabsBadge.title = `当前工作区 (${appState.currentWorkspaceName}): ${currentWinBiliTabs.length} 标签 | 所有工作区: ${totalLocalBiliTabs} 标签`;
 
     // Deleted Videos Badge & Alert Icon
     const deletedList = appState.deletedVideos || [];
@@ -208,7 +245,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Chip 1: Current Workspace
     const currentChip = document.createElement('button');
     currentChip.className = `ws-chip ${appState.selectedWorkspaceFilter === 'current' ? 'active' : ''}`;
-    currentChip.innerHTML = `📍 当前: ${appState.currentWorkspaceName} <span class="chip-count">${currentWinBiliCount}</span>`;
+    currentChip.innerHTML = `📍 当前: ${escapeHtml(appState.currentWorkspaceName)} <span class="chip-count">${currentWinBiliCount}</span>`;
     currentChip.addEventListener('click', () => {
       appState.selectedWorkspaceFilter = 'current';
       renderWorkspaceChips();
@@ -234,7 +271,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       const winChip = document.createElement('button');
       const isSelected = appState.selectedWorkspaceFilter === String(win.id);
       winChip.className = `ws-chip ${isSelected ? 'active' : ''}`;
-      winChip.innerHTML = `📂 ${name} <span class="chip-count">${count}</span>`;
+      winChip.innerHTML = `📂 ${escapeHtml(name)} <span class="chip-count">${count}</span>`;
       winChip.addEventListener('click', () => {
         appState.selectedWorkspaceFilter = String(win.id);
         renderWorkspaceChips();
@@ -425,8 +462,19 @@ document.addEventListener('DOMContentLoaded', async () => {
       const card = document.createElement('div');
       card.className = `video-card ${!video.acknowledged ? 'unacknowledged' : ''}`;
 
-      const titleText = video.title || '（未获取到标题）';
-      const channelText = video.channel ? `UP主: ${video.channel}` : 'UP主未知';
+      let titleText = video.title || '';
+      if (!isValidVideoTitle(titleText)) {
+        if (video.bvid && appState.videoHistory && isValidVideoTitle(appState.videoHistory[video.bvid]?.title)) {
+          titleText = appState.videoHistory[video.bvid].title;
+        } else {
+          titleText = '（原视频标题未获取）';
+        }
+      }
+      const channelText = (video.channel && video.channel !== '未知UP主')
+        ? `UP主: ${video.channel}`
+        : (video.bvid && appState.videoHistory && appState.videoHistory[video.bvid]?.channel)
+          ? `UP主: ${appState.videoHistory[video.bvid].channel}`
+          : 'UP主未知';
       const browserTag = video.browser || '未知浏览器';
       const timeStr = formatTime(video.deletedAt);
       const bvid = video.bvid || '';
@@ -489,8 +537,17 @@ document.addEventListener('DOMContentLoaded', async () => {
       searchBiliLink.className = 'action-link';
       searchBiliLink.innerHTML = `🔍 B站搜索补档`;
       searchBiliLink.addEventListener('click', () => {
-        const query = encodeURIComponent(video.title || video.bvid || '');
-        chrome.tabs.create({ url: `https://search.bilibili.com/all?keyword=${query}` });
+        let query = '';
+        if (isValidVideoTitle(video.title)) {
+          query = video.title;
+        } else if (isValidVideoTitle(titleText)) {
+          query = titleText;
+        } else if (video.bvid) {
+          query = video.bvid;
+        } else if (video.channel && video.channel !== '未知UP主') {
+          query = video.channel;
+        }
+        chrome.tabs.create({ url: `https://search.bilibili.com/all?keyword=${encodeURIComponent(query)}` });
       });
       actionsLeft.appendChild(searchBiliLink);
 
@@ -575,6 +632,48 @@ document.addEventListener('DOMContentLoaded', async () => {
       .trim();
   }
 
+  // Error title patterns representing Bilibili video deletion / removal pages
+  const ERROR_TITLE_PATTERNS = [
+    /^视频去哪[了儿呢\?？\s]*$/i,
+    /^啊叻[？\?]?\s*视频不见了.*/i,
+    /^(404(\s*not\s*found)?|404|bilibili-404|404-bilibili|出错了(\s*-\s*bilibili\.com)?)$/i,
+    /^(稿件不可见|该稿件已被下架|稿件已被UP主删除|抱歉[，,].*已被删除|非常抱歉.*|该内容已不存在)$/i,
+    /^(原视频已失效|视频已失效|该视频已失效|已失效|视频不存在|原视频不存在|视频不见了)$/i,
+    /^(已删除的B站视频|Unknown Video Title|（原视频标题未获取）|原视频标题未获取|（未获取到标题）|未获取到标题)$/i,
+    /^(B站视频|B站页面|B站标签页|B站首页)$/i
+  ];
+
+  // Check if text indicates a removed/deleted video or error state
+  function isDeletedOrErrorText(text) {
+    if (!text) return false;
+    const raw = text.trim();
+    const cleaned = cleanTitle(raw);
+    for (const pat of ERROR_TITLE_PATTERNS) {
+      if (pat.test(raw) || (cleaned && pat.test(cleaned))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Validate that an extracted title is a genuine video title
+  function isValidVideoTitle(title) {
+    if (!title) return false;
+    const t = cleanTitle(title);
+    if (!t) return false;
+    if (
+      t === 'B站视频' ||
+      t === 'B站页面' ||
+      t === 'B站标签页' ||
+      t === 'B站首页' ||
+      t.startsWith('哔哩哔哩') ||
+      t.startsWith('bilibili')
+    ) {
+      return false;
+    }
+    return !isDeletedOrErrorText(t);
+  }
+
   function escapeHtml(text) {
     if (!text) return '';
     const div = document.createElement('div');
@@ -584,7 +683,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // Rename current workspace dialog
   async function promptRenameCurrentWorkspace() {
-    const newName = prompt(`请输入当前工作区名称（如 Mixed、Dev 等）：`, appState.currentWorkspaceName);
+    const newName = prompt(`请输入当前工作区名称（如 工作区 1、学习、娱乐 等）：`, appState.currentWorkspaceName);
     if (newName && newName.trim()) {
       await chrome.runtime.sendMessage({
         type: 'SET_WORKSPACE_NAME',

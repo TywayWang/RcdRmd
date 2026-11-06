@@ -7,12 +7,28 @@ Zero external dependencies: uses Python standard library http.server.
 import json
 import os
 import sys
+import re
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 
-PORT = 32188
-DATASET_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rcdrmd-dataset.json')
+sys.dont_write_bytecode = True
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+PORT = int(os.environ.get('RCDRMD_PORT', '32188'))
+DATASET_FILE = os.environ.get(
+    'RCDRMD_DATASET_FILE',
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rcdrmd-dataset.json')
+)
+
+# Shared token that must accompany every data request.
+# The real hardening is localhost-only binding; this token blocks casual
+# drive-by requests from arbitrary web pages that don't know it.
+SYNC_TOKEN = 'rcdrmd-local-sync-token'
+
 
 def load_dataset():
     if os.path.exists(DATASET_FILE):
@@ -29,6 +45,7 @@ def load_dataset():
         "allTrackedHistory": {}
     }
 
+
 def save_dataset(data):
     try:
         data["updatedAt"] = datetime.utcnow().isoformat() + "Z"
@@ -39,13 +56,59 @@ def save_dataset(data):
     except Exception as e:
         print(f"[Sync Server] Error saving dataset: {e}")
 
+
 dataset = load_dataset()
 
+ERROR_TITLE_PATTERNS = [
+    re.compile(r"^视频去哪[了儿呢\?？\s]*$", re.IGNORECASE),
+    re.compile(r"^啊叻[？\?]?\s*视频不见了.*", re.IGNORECASE),
+    re.compile(r"^(404(\s*not\s*found)?|404|bilibili-404|404-bilibili|出错了(\s*-\s*bilibili\.com)?)$", re.IGNORECASE),
+    re.compile(r"^(稿件不可见|该稿件已被下架|稿件已被UP主删除|抱歉[，,].*已被删除|非常抱歉.*|该内容已不存在)$", re.IGNORECASE),
+    re.compile(r"^(原视频已失效|视频已失效|该视频已失效|已失效|视频不存在|原视频不存在|视频不见了)$", re.IGNORECASE),
+    re.compile(r"^(已删除的B站视频|Unknown Video Title|（原视频标题未获取）|原视频标题未获取|（未获取到标题）|未获取到标题)$", re.IGNORECASE),
+    re.compile(r"^(B站视频|B站页面|B站标签页|B站首页)$", re.IGNORECASE),
+]
+
+
+def clean_title(text):
+    if not text:
+        return ""
+    t = re.sub(r"_哔哩哔哩_bilibili.*", "", text, flags=re.IGNORECASE)
+    t = re.sub(r"_哔哩哔哩.*", "", t, flags=re.IGNORECASE)
+    t = re.sub(r" - 哔哩哔哩.*", "", t, flags=re.IGNORECASE)
+    t = re.sub(r" - bilibili.*", "", t, flags=re.IGNORECASE)
+    return t.strip()
+
+
+def is_deleted_or_error_text(text):
+    if not text:
+        return False
+    raw = text.strip()
+    cleaned = clean_title(raw)
+    for pat in ERROR_TITLE_PATTERNS:
+        if pat.match(raw) or (cleaned and pat.match(cleaned)):
+            return True
+    return False
+
+
+def is_valid_video_title(text):
+    if not text:
+        return False
+    t = clean_title(text)
+    if not t or t in ['B站视频', 'B站页面', 'B站标签页', 'B站首页'] or t.startswith('哔哩哔哩') or t.startswith('bilibili'):
+        return False
+    return not is_deleted_or_error_text(t)
+
+
 class SyncHandler(BaseHTTPRequestHandler):
+    def _is_valid_token(self):
+        return self.headers.get('X-RcdRmd-Token') == SYNC_TOKEN
+
     def _set_cors(self):
-        self.send_header('Access-Control-Allow-Origin', '*')
+        if self._is_valid_token():
+            self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Accept')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Accept, X-RcdRmd-Token')
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -54,6 +117,14 @@ class SyncHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
+        if not self._is_valid_token():
+            self.send_response(401)
+            self._set_cors()
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(b'{"error":"Unauthorized: missing or invalid X-RcdRmd-Token"}')
+            return
+
         if parsed.path == '/api/status':
             self.send_response(200)
             self._set_cors()
@@ -68,7 +139,7 @@ class SyncHandler(BaseHTTPRequestHandler):
                 "activeBrowsers": active_browsers,
                 "totalTabsAcrossBrowsers": total_tabs,
                 "totalDeletedVideos": len(dataset.get("deletedVideos", [])),
-                "datasetPath": DATASET_FILE,
+                "datasetFile": os.path.basename(DATASET_FILE),
                 "updatedAt": dataset.get("updatedAt")
             }
             self.wfile.write(json.dumps(res, ensure_ascii=False).encode('utf-8'))
@@ -90,6 +161,14 @@ class SyncHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
+        if not self._is_valid_token():
+            self.send_response(401)
+            self._set_cors()
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(b'{"error":"Unauthorized: missing or invalid X-RcdRmd-Token"}')
+            return
+
         if parsed.path == '/api/sync':
             length = int(self.headers.get('Content-Length', 0))
             body_bytes = self.rfile.read(length)
@@ -114,7 +193,7 @@ class SyncHandler(BaseHTTPRequestHandler):
                 for t in incoming_tabs:
                     bvid = t.get("bvid")
                     title = t.get("title")
-                    if bvid and title:
+                    if bvid and title and is_valid_video_title(title):
                         dataset["allTrackedHistory"][bvid] = {
                             "title": title,
                             "channel": t.get("channel", ""),
@@ -131,6 +210,17 @@ class SyncHandler(BaseHTTPRequestHandler):
                         continue
                     bvid = del_item.get("bvid")
                     item_id = del_item.get("id")
+
+                    if not is_valid_video_title(del_item.get("title")) and bvid and bvid in dataset.get("allTrackedHistory", {}):
+                        hist_title = dataset["allTrackedHistory"][bvid].get("title")
+                        if is_valid_video_title(hist_title):
+                            del_item["title"] = hist_title
+
+                    if (not del_item.get("channel") or del_item.get("channel") == "未知UP主") and bvid and bvid in dataset.get("allTrackedHistory", {}):
+                        hist_channel = dataset["allTrackedHistory"][bvid].get("channel")
+                        if hist_channel and hist_channel != "未知UP主":
+                            del_item["channel"] = hist_channel
+
                     match_idx = -1
                     for idx, v in enumerate(dataset["deletedVideos"]):
                         if (bvid and v.get("bvid") == bvid) or (item_id and v.get("id") == item_id):
@@ -141,11 +231,15 @@ class SyncHandler(BaseHTTPRequestHandler):
                         del_item_copy = dict(del_item)
                         del_item_copy["recordedByServerAt"] = datetime.utcnow().isoformat() + "Z"
                         dataset["deletedVideos"].insert(0, del_item_copy)
-                        print(f"[Sync Server] ⚠️ Registered DELETED video from {browser_name}: {del_item.get('title')}")
+                        print(f"[Sync Server] [!] Registered DELETED video from {browser_name}: {del_item.get('title')}")
                     else:
-                        if del_item.get("title") and del_item.get("title") not in ["已删除的B站视频", "Deleted Bilibili Video"]:
+                        if is_valid_video_title(del_item.get("title")):
                             dataset["deletedVideos"][match_idx]["title"] = del_item["title"]
-                        if del_item.get("channel"):
+                        elif not is_valid_video_title(dataset["deletedVideos"][match_idx].get("title")) and bvid and bvid in dataset.get("allTrackedHistory", {}):
+                            hist_title = dataset["allTrackedHistory"][bvid].get("title")
+                            if is_valid_video_title(hist_title):
+                                dataset["deletedVideos"][match_idx]["title"] = hist_title
+                        if del_item.get("channel") and del_item.get("channel") != "未知UP主":
                             dataset["deletedVideos"][match_idx]["channel"] = del_item["channel"]
 
                 dataset["deletedVideos"] = [
@@ -153,7 +247,19 @@ class SyncHandler(BaseHTTPRequestHandler):
                     if "http 412" not in (v.get("reason") or "").lower()
                     and "http 403" not in (v.get("reason") or "").lower()
                     and "http 429" not in (v.get("reason") or "").lower()
+                    and "http 5" not in (v.get("reason") or "").lower()
                 ]
+
+                for v in dataset["deletedVideos"]:
+                    v_bvid = v.get("bvid")
+                    if not is_valid_video_title(v.get("title")) and v_bvid and v_bvid in dataset.get("allTrackedHistory", {}):
+                        hist_t = dataset["allTrackedHistory"][v_bvid].get("title")
+                        if is_valid_video_title(hist_t):
+                            v["title"] = hist_t
+                    if (not v.get("channel") or v.get("channel") == "未知UP主") and v_bvid and v_bvid in dataset.get("allTrackedHistory", {}):
+                        hist_c = dataset["allTrackedHistory"][v_bvid].get("channel")
+                        if hist_c and hist_c != "未知UP主":
+                            v["channel"] = hist_c
 
                 save_dataset(dataset)
 
@@ -189,20 +295,22 @@ class SyncHandler(BaseHTTPRequestHandler):
         self._set_cors()
         self.end_headers()
 
+
 def run():
     server_address = ('127.0.0.1', PORT)
     httpd = HTTPServer(server_address, SyncHandler)
     print("=" * 52)
-    print(f"  RcdRmd Local Cross-Browser Sync Hub (Python)")
+    print("  RcdRmd Local Cross-Browser Sync Hub (Python)")
     print(f"  Running on: http://127.0.0.1:{PORT}")
-    print(f"  Dataset storage: {DATASET_FILE}")
-    print(f"  Ready for Microsoft Edge, Chrome & Chrome Canary")
+    print(f"  Dataset storage: {os.path.basename(DATASET_FILE)}")
+    print("  Ready for Microsoft Edge, Chrome & Chrome Canary")
     print("=" * 52)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\n[Sync Server] Shutting down.")
         httpd.server_close()
+
 
 if __name__ == '__main__':
     run()

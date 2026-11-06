@@ -16,7 +16,7 @@ if %ERRORLEVEL% EQU 0 (
 where python >nul 2>nul
 if %ERRORLEVEL% EQU 0 (
     echo [OK] Python detected. Launching rcdrmd-sync-server.py...
-    python rcdrmd-sync-server.py
+    python -B rcdrmd-sync-server.py
     goto end
 )
 
